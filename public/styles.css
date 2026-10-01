@@ -588,3 +588,26 @@ body {
   border: 1px solid var(--line);
   border-radius: 6px;
 }
+
+/* 两版净变化对照 */
+.diff-picker { margin-bottom: 12px; }
+.diff-picker h3 { margin: 0 0 6px; font-size: 15px; color: var(--primary-dark); }
+.diff-picker-row { display: flex; align-items: flex-end; gap: 10px; margin: 8px 0; }
+.diff-picker-row label { display: flex; flex-direction: column; gap: 4px; font-size: 12.5px; color: var(--muted); flex: 1; }
+.diff-picker-row select { padding: 5px 6px; font-size: 13px; }
+.diff-arrow { font-size: 18px; color: var(--primary); padding-bottom: 6px; }
+.diff-summary { display: flex; gap: 8px; flex-wrap: wrap; margin: 10px 0; }
+.diff-body { max-height: 62vh; overflow-y: auto; }
+.diff-seg { border: 1px solid var(--line); border-radius: 6px; padding: 10px 12px; margin-bottom: 12px; }
+.diff-seg.is-secret { background: #faf7f2; border-style: dashed; }
+.diff-seg-head { font-size: 14px; margin-bottom: 8px; }
+.diff-seg-head .card-meta { margin-left: 8px; }
+.diff-table { width: 100%; border-collapse: collapse; font-size: 13.5px; }
+.diff-table th, .diff-table td { border: 1px solid #d8dde6; padding: 5px 8px; vertical-align: top; text-align: left; }
+.diff-table th { background: #f2f5fa; }
+.diff-table code { color: #555; font-variant-numeric: tabular-nums; font-size: 12.5px; }
+.diff-text { margin-top: 3px; word-break: break-all; }
+.diff-old .diff-text { background: var(--conflict-bg); }
+.diff-new .diff-text { background: var(--adopt-bg); font-weight: 600; }
+.diff-props { white-space: normal; min-width: 150px; }
+.diff-props .tag { display: inline-block; margin: 0 4px 4px 0; }

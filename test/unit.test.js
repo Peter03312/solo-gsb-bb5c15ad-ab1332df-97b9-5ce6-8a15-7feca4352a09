@@ -2,7 +2,7 @@
 // 纯文本算子单元测试（码点偏移、合版、引用映射、续提换算）
 const assert = require('assert');
 const crypto = require('crypto');
-const { codeLength, sliceCP, validateRange, applyEdits, transformRange, transformRangeRebase, editTouchesAnchor, replayProvenance } = require('../src/text');
+const { codeLength, sliceCP, validateRange, applyEdits, transformRange, transformRangeRebase, editTouchesAnchor, replayProvenance, identityTokens, replayIdentityTo, replayIdentityContinuation, alignIdentityTokens, diffHunks } = require('../src/text');
 const { parseTranscript } = require('../src/store');
 const { sniffMediaType, sha256, MEDIA_TYPES, formatBytes } = require('../src/attachments');
 
@@ -213,5 +213,99 @@ ok(sniffMediaType(Buffer.concat([Buffer.from([0xff, 0xd8, 0xff, 0xe1]), Buffer.f
 const known = crypto.createHash('sha-256').update('abc').digest('hex');
 ok(sha256(Buffer.from('abc')) === known, 'SHA-256 计算与标准向量一致');
 ok(formatBytes(500) === '500 B' && /KB/.test(formatBytes(2048)) && /MB/.test(formatBytes(5 * 1024 * 1024)), '文件大小可读格式化');
+
+// ---------- 两版净变化：码点身份重放 + 身份对齐（绝不按同文搜索配对） ----------
+// 工具：构造一组 steps，重放到指定版本
+function idReplay(text, steps, until, seqOf = new Map()) {
+  return replayIdentityTo(text, steps, until, seqOf);
+}
+function kinds(ops) { return ops.map((o) => o.kind[0] + (o.text ? `(${o.text})` : '')); }
+
+// 初始身份：每个码点带稳定 key，origin=null
+let init = identityTokens('甲乙丙');
+ok(init.map((t) => t.key).join(',') === 'i0,i1,i2' && init.every((t) => t.origin === null),
+  '身份重放：初始码点身份为 i0/i1/i2 且归初始导入');
+
+// 替换：旧码点被删、新码点归提议；再对同文重写应得到不同身份（不按同文配对）
+{
+  const steps = [
+    { version: 2, edits: [{ id: 1, start: 0, end: 3, replace: 'XYZ' }] },
+    { version: 3, edits: [{ id: 2, start: 0, end: 3, replace: '甲乙丙' }] }, // 改回原文
+  ];
+  const seq = new Map();
+  const at2 = idReplay('甲乙丙', steps, 2, seq).tokens;
+  const at3 = idReplay('甲乙丙', steps, 3, seq).tokens;
+  ok(at3.map((t) => t.ch).join('') === '甲乙丙', '身份重放：改回原文后文本与 v1 相同');
+  ok(at3.every((t) => t.origin && t.origin.proposalId === 2),
+    '身份重放：改回原文的码点身份仍是提议 #2（不与 v1 旧码点同身份）');
+  // 旧版(v1)与新版(v3)按身份对齐：整段身份全不同，但两端同文 → diffHunks 应剔除（无净变化）
+  const v1 = idReplay('甲乙丙', steps, 1, new Map()).tokens;
+  const hunks = diffHunks(alignIdentityTokens(v1, at3));
+  ok(hunks.length === 0, '两端同文（中途改回）不算变化：不产生变化块');
+}
+
+// 常规替换 + 删除 + 未变：对齐得到 del/ins 与 equal
+{
+  // 甲乙丙丁戊 -> X乙C丁（甲->X@v2，丙->C@v3，戊删除@v2）
+  const steps = [
+    { version: 2, edits: [
+      { id: 7, start: 0, end: 1, replace: 'X' },
+      { id: 9, start: 4, end: 5, replace: '' },
+    ] },
+    { version: 3, edits: [{ id: 8, start: 2, end: 3, replace: 'C' }] },
+  ];
+  const seq = new Map();
+  const oldT = idReplay('甲乙丙丁戊', steps, 1, seq).tokens;
+  const newT = idReplay('甲乙丙丁戊', steps, 3, seq).tokens;
+  const ops = alignIdentityTokens(oldT, newT);
+  ok(kinds(ops).join(' ') === 'd(甲) i(X) e(乙) d(丙) i(C) e(丁) d(戊)',
+    '身份对齐：替换/删除/保留产出确定的 del/ins/equal 序列：' + kinds(ops).join(' '));
+  const hunks = diffHunks(ops);
+  ok(hunks.length === 3, '三块净变化（甲->X、丙->C、删戊），未变的乙丁不列');
+  ok(hunks[0].oldText === '甲' && hunks[0].newText === 'X' &&
+     hunks[0].oldStart === 0 && hunks[0].oldEnd === 1 &&
+     hunks[0].newStart === 0 && hunks[0].newEnd === 1, '块坐标：旧/新 Unicode 码点半开区间正确');
+  ok(hunks[2].oldText === '戊' && hunks[2].newText === '' &&
+     hunks[2].newStart === hunks[2].newEnd, '纯删除：新块为零长度插入区间（端点相等）');
+}
+
+// 纯插入：新坐标为零长度插入点
+{
+  const steps = [{ version: 2, edits: [{ id: 3, start: 1, end: 1, replace: '插' }] }];
+  const seq = new Map();
+  const oldT = idReplay('甲乙', steps, 1, seq).tokens;
+  const newT = idReplay('甲乙', steps, 2, seq).tokens;
+  const hunks = diffHunks(alignIdentityTokens(oldT, newT));
+  ok(hunks.length === 1 && hunks[0].oldText === '' && hunks[0].newText === '插' &&
+     hunks[0].oldStart === 1 && hunks[0].oldEnd === 1 && hunks[0].newStart === 1 && hunks[0].newEnd === 2,
+    '纯插入：旧块为零长度区间 [1,1)，新块 [1,2)');
+}
+
+// 区间重放的删除方：v2 插入 P，v3 把 P 改成 Q，从 v2 看到 v4（v4 删 Q）时，
+// v2 的旧码点 P 是在区间 (v2,v4] 内被提议 #2 删除的，删除方须正确归属。
+{
+  const steps = [
+    { version: 2, edits: [{ id: 1, start: 1, end: 1, replace: 'P' }] },       // 甲P乙丙
+    { version: 3, edits: [{ id: 2, start: 1, end: 2, replace: 'Q' }] },      // 甲Q乙丙
+    { version: 4, edits: [{ id: 3, start: 1, end: 2, replace: '' }] },       // 甲乙丙
+  ];
+  const seq = new Map();
+  const at2 = idReplay('甲乙丙', steps, 2, seq).tokens;
+  const cont = replayIdentityContinuation(at2, steps, 2, 4, seq);
+  const d = cont.deleters.get(at2[1].key); // P 的身份在区间内被删
+  ok(cont.tokens.map((t) => t.ch).join('') === '甲乙丙', '区间重放：v2→v4 文本还原');
+  ok(d && d.proposalId === 2 && d.version === 3, '区间删除方：旧码点 P 归删除它的提议 #2@v3（而非更晚删除 Q 的 #3）');
+}
+
+// 增补平面字符（emoji）按 1 码点对齐
+{
+  const steps = [{ version: 2, edits: [{ id: 5, start: 1, end: 2, replace: '🙂' }] }];
+  const seq = new Map();
+  const oldT = idReplay('a😀b', steps, 1, seq).tokens;
+  const newT = idReplay('a😀b', steps, 2, seq).tokens;
+  const hunks = diffHunks(alignIdentityTokens(oldT, newT));
+  ok(oldT.length === 3 && newT.length === 3 && hunks.length === 1 &&
+     hunks[0].oldText === '😀' && hunks[0].newText === '🙂', '净变化：emoji 按 1 个码点对齐与替换');
+}
 
 console.log(`\n单元测试全部通过：${n} 项 ✅`);

@@ -156,6 +156,12 @@ app.get('/api/versions/:id/sources/:seg', requireAuth, wrap((req, res) => {
   ));
 }));
 
+// ---------- 两版净变化对照（按时间先后的两个已发布版本·按段；保密段对参与者只见占位） ----------
+// 查询为只读：不改写任何版本、提议、决议或保密状态。
+app.get('/api/version-diff', requireAuth, wrap((req, res) => {
+  res.json(store.versionDiffView(db, req.query.from, req.query.to, req.user));
+}));
+
 // ---------- 提议依据附件 ----------
 // 上传：请求体为文件原始字节（application/octet-stream，或任意非 JSON 类型），
 // 原始文件名与预期 SHA-256 经请求头提交。仅记录员、且仅对本人“待复核”提议。

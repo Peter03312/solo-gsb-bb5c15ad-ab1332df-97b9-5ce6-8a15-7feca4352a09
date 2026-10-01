@@ -993,16 +993,115 @@ function renderObjections() {
 function renderVersions() {
   const panel = $('#panel-versions');
   if (!booth || !booth.initialized) { panel.innerHTML = '<div class="empty">尚无版本。</div>'; return; }
-  panel.innerHTML = booth.versions.map((v) => `
+  const opts = booth.versions.map((v) => `<option value="${v.id}">v${v.id}${v.note ? ` · ${esc(v.note)}` : ''}</option>`).join('');
+  panel.innerHTML = `
+    <div class="diff-picker card">
+      <h3>两版净变化对照</h3>
+      <p class="card-meta">按时间先后选择两个已发布版本，逐段对照端点正文：给出旧版/新版 Unicode 码点半开区间与文字，
+        以及促成每处变化的跨版已发布提议编号与发布版本。中途改回、两端同文的部分不算变化，未变段不列。</p>
+      <div class="diff-picker-row">
+        <label class="card-meta">旧版
+          <select id="diff-from">${opts}</select>
+        </label>
+        <span class="diff-arrow">→</span>
+        <label class="card-meta">新版
+          <select id="diff-to">${opts}</select>
+        </label>
+      </div>
+      <button class="btn primary small" id="diff-go">对照净变化</button>
+      <div id="diff-msg" class="error-text"></div>
+    </div>
+    ${booth.versions.map((v) => `
     <div class="ver-card">
       <div>
         <div class="vid">v${v.id} ${v.id === booth.currentVersion.id ? '<span class="tag tag-published">当前</span>' : ''}</div>
         <div class="card-meta">${esc(v.note) || '<span class="muted">版本备注仅工作人员可见</span>'} · ${esc(v.creator_name || '系统')} · ${v.created_at} UTC</div>
       </div>
       <button class="btn small" data-ver="${v.id}">只读查看</button>
-    </div>`).join('');
+    </div>`).join('')}`;
+  // 默认选最早与最新版本（严格早于）
+  const ids = booth.versions.map((v) => v.id);
+  $('#diff-from').value = String(ids[0]);
+  $('#diff-to').value = String(ids[ids.length - 1]);
+  $('#diff-go').addEventListener('click', () => {
+    const from = parseInt($('#diff-from').value, 10);
+    const to = parseInt($('#diff-to').value, 10);
+    openVersionDiff(from, to);
+  });
   $$('#panel-versions [data-ver]').forEach((b) =>
     b.addEventListener('click', () => openVersion(parseInt(b.dataset.ver, 10))));
+}
+
+// ---------- 两版净变化对照 ----------
+async function openVersionDiff(from, to) {
+  const msg = $('#diff-msg');
+  if (msg) msg.textContent = '';
+  if (!Number.isInteger(from) || !Number.isInteger(to)) {
+    if (msg) msg.textContent = '请选择两个已发布版本。';
+    return;
+  }
+  if (from >= to) {
+    if (msg) msg.textContent = `版本顺序不合法：旧版 v${from} 必须严格早于新版 v${to}。`;
+    return;
+  }
+  try {
+    const data = await api(`/api/version-diff?from=${from}&to=${to}`);
+    showVersionDiffModal(data);
+  } catch (err) {
+    if (msg) msg.textContent = err.message;
+    else toast(err.message, 'error');
+  }
+}
+
+function diffProposalTags(proposals) {
+  if (!proposals || !proposals.length) return '<span class="muted">（几何对齐：无单独写入/删除提议）</span>';
+  return proposals.map((p) => {
+    const roleLabel = p.roles && p.roles.length
+      ? p.roles.map((r) => (r === 'insert' ? '写入' : r === 'delete' ? '删除' : r)).join('/')
+      : '';
+    return `<span class="tag tag-adopted" title="促成该变化（${esc(roleLabel)}）">提议 #${p.proposalId} · v${p.versionId} 发布${roleLabel ? `（${esc(roleLabel)}）` : ''}</span>`;
+  }).join(' ');
+}
+
+function showVersionDiffModal(d) {
+  const rows = (segs) => segs.map((s) => {
+    if (s.secret) {
+      return `<div class="diff-seg is-secret">
+        <div class="diff-seg-head">🔒 第 ${s.seg} 段 · <span class="secret-placeholder">${esc(s.text)}</span></div>
+        <div class="muted">该段当前保密：你只能看到占位，不获得该段正文、变化数量或提议信息；解除保密后可重新对照。</div>
+      </div>`;
+    }
+    return `<div class="diff-seg">
+      <div class="diff-seg-head">第 ${s.seg} 段 · <b>${s.changes.length}</b> 处净变化
+        <span class="card-meta">旧版 ${s.oldLength} 码点 → 新版 ${s.newLength} 码点</span></div>
+      <table class="diff-table">
+        <thead><tr><th>旧版区间/文字（v${d.fromVersion.id}）</th><th>新版区间/文字（v${d.toVersion.id}）</th><th>促成变化的跨版已发布提议</th></tr></thead>
+        <tbody>${s.changes.map((c) => `<tr>
+          <td class="diff-old"><code>[${c.oldStart}, ${c.oldEnd})</code><div class="diff-text">${esc(c.oldText) || '<span class="muted">（空·插入点）</span>'}</div></td>
+          <td class="diff-new"><code>[${c.newStart}, ${c.newEnd})</code><div class="diff-text">${esc(c.newText) || '<span class="muted">（空·已删除）</span>'}</div></td>
+          <td class="diff-props">${diffProposalTags(c.proposals)}</td>
+        </tr>`).join('')}</tbody>
+      </table>
+    </div>`;
+  }).join('');
+
+  const secretCount = d.segments.filter((s) => s.secret).length;
+  openModal(`
+      <div class="v-head">
+        <h3>两版净变化对照：v${d.fromVersion.id} → v${d.toVersion.id}</h3>
+        <button class="btn small" data-close>关闭</button>
+      </div>
+      <div class="v-meta">v${d.fromVersion.id}（${esc(d.fromVersion.note) || '备注仅工作人员可见'}） →
+        v${d.toVersion.id}（${esc(d.toVersion.note) || '备注仅工作人员可见'}）</div>
+      <p class="muted">码点身份沿每次发布的坐标映射追踪（不按同文搜索配对）：
+        中途改动最终撤销、两端文字相同的整块不算变化，未变段不列；区间为该段 Unicode 码点半开区间 [start,end)（emoji 按 1 码点计）。</p>
+      <div class="diff-summary">
+        <span class="tag tag-published">有净变化的段：${d.changedSegments}</span>
+        <span class="tag tag-adopted">变化处合计：${d.totalChanges}</span>
+        ${secretCount ? `<span class="tag tag-conflicted">当前保密段（占位）：${secretCount}</span>` : ''}
+      </div>
+      ${d.segments.length ? `<div class="diff-body">${rows(d.segments)}</div>`
+        : '<div class="empty">两个版本之间没有净变化（可能未发布修订，或全部中途改动最终被撤销、两端文字相同）。</div>'}`, true);
 }
 
 async function openVersion(id) {

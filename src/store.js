@@ -1,6 +1,6 @@
 'use strict';
 // 业务核心：导入、提议、采纳/驳回、冲突标记、发布合版、版本视图、异议引用、基版过期提议的续提
-const { codeLength, sliceCP, validateRange, overlaps, applyEdits, transformRange, transformRangeRebase, editTouchesAnchor, replayProvenance } = require('./text');
+const { codeLength, sliceCP, validateRange, overlaps, applyEdits, transformRange, transformRangeRebase, editTouchesAnchor, replayProvenance, replayIdentityTo, replayIdentityContinuation, alignIdentityTokens, diffHunks } = require('./text');
 const att = require('./attachments');
 
 // ---------- 解析 ----------
@@ -1275,6 +1275,175 @@ function provenanceView(db, versionId, seg, viewer) {
   };
 }
 
+// ---------- 两版净变化对照（按段；码点身份沿逐次发布坐标映射对齐，绝不按同文搜索配对） ----------
+// 收集某段在 (fromVersionId, toVersionId] 之间实际合入的已发布修订（坐标为各自发布基版坐标）。
+// 与 provenanceView / 发布合版采用相同的（起点、id）次序。
+function publishedEditStepsForSeg(db, seg, toVersionId) {
+  const rows = db
+    .prepare(
+      `SELECT id, published_version_id AS ver, start_cp, end_cp, replacement
+       FROM proposals
+       WHERE status='published' AND seg=? AND published_version_id >= 2 AND published_version_id <= ?
+       ORDER BY published_version_id, start_cp, id`
+    )
+    .all(seg, toVersionId);
+  const byVer = new Map();
+  for (const r of rows) {
+    if (!byVer.has(r.ver)) byVer.set(r.ver, []);
+    byVer.get(r.ver).push({ id: r.id, start: r.start_cp, end: r.end_cp, replace: r.replacement });
+  }
+  const steps = [];
+  for (let v = 2; v <= toVersionId; v++) {
+    if (byVer.has(v)) steps.push({ version: v, edits: byVer.get(v) });
+  }
+  return steps;
+}
+
+function validateDiffEndpoints(db, fromId, toId) {
+  if (!getDoc(db)) throw conflict('尚未导入逐字稿，无版本可对照', 'NO_DOCUMENT');
+  if (!Number.isInteger(fromId) || !Number.isInteger(toId)) {
+    throw badRequest('缺少有效的版本号：from 与 to 必须为已发布版本的整数编号');
+  }
+  if (fromId < 1 || toId < 1) throw badRequest('版本号必须为正整数（已发布版本从 v1 起）');
+  const from = db.prepare('SELECT id FROM versions WHERE id=?').get(fromId);
+  if (!from) throw notFound(`旧版 v${fromId} 不存在，无法对照`);
+  const to = db.prepare('SELECT id FROM versions WHERE id=?').get(toId);
+  if (!to) throw notFound(`新版 v${toId} 不存在，无法对照`);
+  if (fromId >= toId) {
+    throw conflict(
+      `版本顺序不合法：旧版必须严格早于新版（from < to），本次 from=v${fromId}、to=v${toId}；请按时间先后选择两个已发布版本`,
+      'BAD_VERSION_ORDER'
+    );
+  }
+}
+
+// 对单个段计算两版净变化。oldTokens/toTokens 由逐次发布的码点身份重放得到；
+// 身份对齐产出变化块，旧块码点的“移除提议（删除方）”与新块码点的“最后写入提议（新增方）”
+// 共同构成促成该块的跨版已发布提议集合。中途改动最终撤销、两端同文的整块在 diffHunks 内已剔除。
+function diffOneSegment(seg, initialText, steps, fromId, toId, oldText, newText) {
+  // 同一份 seqOf 贯穿两次重放：任一已发布提议插入的码点在旧版链/新版链得到同一稳定身份。
+  const seqOf = new Map();
+  const oldR = replayIdentityTo(initialText, steps, fromId, seqOf);
+  const oldTokens = oldR.tokens;
+  // 新版码点从旧版身份出发、只重放 (fromId,toId] 区间修订得到；
+  // intervalDeleters 记录该区间内每个被移除身份（含旧码点与中途插入码点）的删除方。
+  const cont = replayIdentityContinuation(oldTokens, steps, fromId, toId, seqOf);
+  const newTokens = cont.tokens;
+  const intervalDeleters = cont.deleters;
+  // 两版重放都须与各自不可变快照逐码点一致；不一致只可能是数据损坏，明确报错而非编造对照。
+  const replayOld = oldTokens.map((t) => t.ch).join('');
+  const replayNew = newTokens.map((t) => t.ch).join('');
+  if (replayOld !== oldText || replayNew !== newText) {
+    throw Object.assign(
+      new Error(`净变化重放与版本快照不一致（第 ${seg} 段 v${fromId}/v${toId}），拒绝输出对照（数据可能已损坏）`),
+      { status: 500, code: 'DIFF_REPLAY_MISMATCH' }
+    );
+  }
+  const ops = alignIdentityTokens(oldTokens, newTokens);
+  const rawHunks = diffHunks(ops);
+
+  const changes = rawHunks.map((h) => {
+    const contrib = new Map(); // key `${proposalId}@${version}` -> {proposalId,version,role}
+    const add = (p, role) => {
+      const k = `${p.proposalId}@${p.version}`;
+      const cur = contrib.get(k);
+      if (!cur) contrib.set(k, { proposalId: p.proposalId, versionId: p.version, roles: [role] });
+      else if (!cur.roles.includes(role)) cur.roles.push(role);
+    };
+    // 新块：取落在新坐标区间内的新码点来源（必然是区间内由跨版提议写入的码点）
+    for (let c = h.newStart; c < h.newEnd; c++) {
+      const t = newTokens[c];
+      const w = t && t.origin;
+      if (w) add(w, 'insert');
+    }
+    // 旧块：每个被移除码点由区间删除方记录的跨版提议删除（删除方）
+    for (let c = h.oldStart; c < h.oldEnd; c++) {
+      const t = oldTokens[c];
+      const d = intervalDeleters.get(t.key);
+      if (d) add(d, 'delete');
+    }
+    const proposals = [...contrib.values()].sort((a, b) =>
+      a.versionId - b.versionId || a.proposalId - b.proposalId
+    );
+    return {
+      oldStart: h.oldStart, oldEnd: h.oldEnd,
+      newStart: h.newStart, newEnd: h.newEnd,
+      oldText: h.oldText,
+      newText: h.newText,
+      proposals,
+    };
+  });
+
+  return {
+    seg,
+    oldLength: codeLength(oldText),
+    newLength: codeLength(newText),
+    changes,
+  };
+}
+
+// 严格解析版本号查询参数：只接受十进制整数字符串（拒绝 1.5、1x、空串、科学计数等），
+// 非法返回 null（由 validateDiffEndpoints 统一报 400）。
+function parseVersionInt(raw) {
+  if (typeof raw !== 'string' || !/^-?\d+$/.test(raw.trim())) return null;
+  const n = Number(raw.trim());
+  return Number.isSafeInteger(n) ? n : null;
+}
+
+function versionDiffView(db, fromIdRaw, toIdRaw, viewer) {
+  const fromId = parseVersionInt(fromIdRaw);
+  const toId = parseVersionInt(toIdRaw);
+  validateDiffEndpoints(db, fromId, toId);
+
+  const oldVer = db.prepare('SELECT * FROM versions WHERE id=?').get(fromId);
+  const newVer = db.prepare('SELECT * FROM versions WHERE id=?').get(toId);
+  const oldSegs = segmentsOf(oldVer);
+  const newSegs = segmentsOf(newVer);
+  const secrets = secretSegs(db);
+  const staff = isStaff(viewer);
+
+  // v1 原文按段取出（段号跨版本不变，段结构不被修订改写）
+  const v1 = db.prepare('SELECT * FROM versions WHERE id=1').get();
+  const v1TextOf = new Map(segmentsOf(v1).map((s) => [s.seg, s.text]));
+  const newTextOf = new Map(newSegs.map((s) => [s.seg, s.text]));
+
+  const segments = [];
+  let changedSegments = 0;
+  let totalChanges = 0;
+  for (const oldS of oldSegs) {
+    const seg = oldS.seg;
+    const newText = newTextOf.get(seg);
+    const isSec = secrets.has(seg);
+    // 参与者查看当前保密段：只见占位，不获得该段文字、变化数量或提议信息
+    if (!staff && isSec) {
+      segments.push({ seg, secret: true, text: SECRET_PLACEHOLDER, oldLength: null, newLength: null, changes: [] });
+      continue;
+    }
+    if (!v1TextOf.has(seg)) {
+      throw new Error(`DIFF_INCONSISTENT：第 ${seg} 段在初始版本 v1 中不存在（段结构异常）`);
+    }
+    if (newText === undefined) {
+      throw new Error(`DIFF_INCONSISTENT：第 ${seg} 段在新版 v${toId} 中缺失（段结构异常）`);
+    }
+    const steps = publishedEditStepsForSeg(db, seg, toId);
+    const result = diffOneSegment(seg, v1TextOf.get(seg), steps, fromId, toId, oldS.text, newText);
+    if (result.changes.length > 0) {
+      changedSegments++;
+      totalChanges += result.changes.length;
+    }
+    segments.push({ seg, secret: false, ...result });
+  }
+
+  return {
+    fromVersion: { id: oldVer.id, note: staff ? oldVer.note : '', createdAt: oldVer.created_at },
+    toVersion: { id: newVer.id, note: staff ? newVer.note : '', createdAt: newVer.created_at },
+    changedSegments,
+    totalChanges,
+    // segments 仅含有净变化的段（未变段不列变化）；参与者视角的当前保密段只给占位
+    segments: segments.filter((s) => s.secret || s.changes.length > 0),
+  };
+}
+
 module.exports = {
   parseTranscript,
   importTranscript,
@@ -1291,6 +1460,7 @@ module.exports = {
   boothView,
   versionView,
   provenanceView,
+  versionDiffView,
   stageProposals,
   previewSegments,
   setSegmentSecret,

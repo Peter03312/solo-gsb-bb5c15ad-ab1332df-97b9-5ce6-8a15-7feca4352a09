@@ -11,6 +11,14 @@
 片段文字与来源（初始导入，或最后写入该片段的已发布提议编号与发布版本）；来源沿逐次发布的修订
 几何重放得到，未触及文字保留原来源、替换/插入归本次提议、删除不占结果——不按同文搜索猜测。
 
+**已登录用户可选择两个按时间先后排列的已发布版本，在网页按段对照端点正文的净变化**：服务端给出
+每处变化在旧版、新版的 Unicode 码点半开区间与对应文字，并列出促成每处变化的**跨版已发布提议编号与
+发布版本**。码点身份沿每次发布的坐标映射追踪（splice 保持次序），**重复文字不靠搜索配对**；中途
+改动最终撤销、两端文字相同的整块不算变化，未变段不列变化。参与者查看当前保密段时只见占位，不获得
+该段文字、变化数量或提议信息；解除保密后可重查，工作人员按现有权限查看。未导入、版本不存在或顺序
+不合法（`from ≥ to`）一律明确拒绝；查询为只读，不改写版本、决议或保密状态。
+
+
 **记录员可为本人“待复核”的修订提议上传依据文件**：提交原始文件名与预期 SHA-256，服务端只按内容
 接收可识别的 PDF、PNG、JPEG、MP3、WAV（单件 ≤ 20 MB），并比对实际摘要；待复核期间可删除误传附件，
 提议一经采纳、驳回、标记冲突或发布，附件集合即冻结，原文件随提议与历史决议保留、重启后仍可查阅，
@@ -183,6 +191,16 @@ npm test
    - 参与者对**当前保密段**在**所有版本**都看不到来源：接口返回 403，不获得片段文字、提议编号或来源；
      解除保密后按现有权限立即恢复。未导入（无文档）、未知版本或未知段号一律明确拒绝（409/404），
      不生成虚构来源。
+   - **两版净变化对照（本轮新增）**：在“版本”面板顶部选择**按时间先后的两个已发布版本**（旧版 → 新版，
+     `from < to`）并点击“对照净变化”，即按段给出端点正文的净变化：每处变化的**旧版/新版 Unicode 码点
+     半开区间**（`oldStart/oldEnd`、`newStart/newEnd`）、**旧版文字 `oldText` 与新版文字 `newText`**，以及
+     **促成该变化的跨版已发布提议编号与发布版本**（写入方/删除方）。码点身份沿每次发布的坐标映射追踪，
+     **重复文字不靠搜索配对**；**中途改动最终撤销、两端文字相同的整块不算变化**，**未变段不列**（纯删除时
+     新区间为零长度、纯插入时旧区间为零长度）。
+   - 参与者对**当前保密段**只看到占位行，不获得该段正文、变化数量或提议信息，统计计数也剔除该段；
+     解除保密后可重查，工作人员（记录员/复核员）始终看到真实结果。未导入 409、任一版本不存在 404、
+     顺序不合法（`from ≥ to`，含两版相同）409、版本号非整数 400；对照为**只读查询**，不改写版本、
+     决议或保密状态。
 9. **段级保密（复核员）**：复核员在正文段尾点击“设为保密/解除保密”（或调用 HTTP API），
    也可在工具栏“保密留痕”中查看全部变更。
    - **保密以段号为准**：段号在各版本间不变（发布只改段内正文），一次设置**立即作用于当前及全部历史版本**的
@@ -232,6 +250,7 @@ HTTP 状态码与中文原因，且在数据库事务中执行——失败即回
 | `GET /api/secret-logs` | 复核员 | 保密变更留痕列表（段号、动作、前后状态、操作人、时间） |
 | `GET /api/versions/:id` | 登录用户 | 只读查看不可变版本（正文/决议/异议/发布前异议回应）；参与者视角下保密段仅返回占位且按段过滤决议、异议、回应与版本备注 |
 | `GET /api/versions/:id/sources/:seg` | 登录用户 | **按段查看版本 `:id` 第 `:seg` 段的正文连续片段来源**：返回该段正文与 `fragments`（每片含码点半开区间 `[start,end)`、`text` 与来源：`initial` 初始导入，或 `proposalId`+`versionId` 最后写入该片的已发布提议/发布版本）。来源沿逐次发布的修订几何重放，不按同文猜测；未导入 409、未知版本/段号 404；参与者查看当前保密段 403，解除保密后恢复 |
+| `GET /api/version-diff?from=F&to=T` | 登录用户 | **按段对照两个按时间先后的已发布版本（`from < to`）的净变化**：返回 `fromVersion`/`toVersion`、有净变化的段数与变化处合计，以及每段每处变化的旧版/新版码点半开区间（`oldStart/oldEnd`、`newStart/newEnd`）、旧版文字 `oldText`、新版文字 `newText` 与促成变化的跨版已发布提议（`proposals[]`：`proposalId`、`versionId`、`roles` 写入/删除）。码点身份沿逐次发布坐标映射对齐，不按同文搜索；中途改回、两端同文的整块剔除，未变段不返回。未导入 409、未知版本 404、`from≥to` 409、非整数版本号 400、未登录 401；查询只读。参与者对当前保密段只见 `{seg,secret:true,text:占位}`（不含正文/计数/提议），统计计数也剔除该段；工作人员始终见真实变化，解除保密后参与者可重查 |
 | `POST /api/proposals/:id/attachments` | 记录员（本人） | **上传依据文件**：请求体为文件原始字节（非 JSON），请求头 `X-Attachment-Filename`（原始文件名，UTF-8 百分号编码，仅展示）、`X-Attachment-SHA256`（64 位十六进制预期摘要）。仅对本人**待复核**提议；内容须可识别为 PDF/PNG/JPEG/MP3/WAV 且 ≤ 20 MB，实际摘要须与预期一致。201 返回附件元数据；提议不存在 404、非本人/非记录员 403、已冻结 409、空文件/缺头/类型不可识别 400、摘要不符 422、超限 413；失败不留半成品或孤儿文件 |
 | `DELETE /api/attachments/:aid` | 记录员（上传者本人） | **删除误传附件**（事务内复查最终状态）：仅待复核提议可删；非本人统一 404（不暴露存在性），冻结后 409；元数据与磁盘文件一并移除 |
 | `GET /api/attachments/:aid/download` | 记录员（本人上传）/复核员 | **下载依据文件**：`Content-Type` 按内容嗅探结果、`X-Attachment-SHA256` 为实际摘要、`Content-Disposition` 含 RFC 5987 中文原始文件名。复核员可下载全部，记录员仅限本人上传；**参与者及未授权者一律 404**（不获得内容或地址），未登录 401 |
@@ -359,6 +378,66 @@ curl -s -b /tmp/par.cookie http://localhost:3000/api/versions/1/sources/7
 > 相邻边界、零长度纯插入与后续再次改写都能精确定位；服务端还会校验重放结果与该版不可变快照逐码点
 > 一致，不一致（数据损坏）时报错而非编造来源。
 
+### 两版净变化对照调用示例（curl）
+
+```bash
+# 1) 任一登录用户（记录员/复核员/参与者均可）按时间先后选择两个已发布版本（from < to）
+curl -s -b /tmp/rec.cookie "http://localhost:3000/api/version-diff?from=1&to=3"
+# {
+#   "fromVersion": { "id": 1, "note": "初始导入", "createdAt": "…" },
+#   "toVersion":   { "id": 3, "note": "第二次修订", "createdAt": "…" },
+#   "changedSegments": 1, "totalChanges": 1,
+#   "segments": [
+#     { "seg": 2, "oldLength": 27, "newLength": 27,
+#       "changes": [
+#         { "oldStart": 15, "oldEnd": 19, "newStart": 15, "newEnd": 19,
+#           "oldText": "3月1日", "newText": "3月上旬",
+#           "proposals": [
+#             { "proposalId": 5, "versionId": 3, "roles": ["insert", "delete"] } ] } ] } ] }
+# - oldStart/oldEnd、newStart/newEnd：该处变化在旧版、新版第 2 段内的 Unicode 码点半开区间；
+# - proposals：促成该变化的“跨版已发布提议”——roles 含 "insert"（新版文字的写入方）
+#   与/或 "delete"（旧版文字的删除方，可能在中间版本）；按发布版本、提议编号排序。
+# - 纯删除时 newStart===newEnd 且 newText 为空；纯插入时 oldStart===oldEnd 且 oldText 为空。
+
+# 2) 跨多版、含“中途改回”：两端同文的整块自动剔除，未变段不返回
+curl -s -b /tmp/rec.cookie "http://localhost:3000/api/version-diff?from=1&to=4"
+#   第1段若在 v2 被改、v3 又改回原文，则该段不出现在 segments（changedSegments 不计它）；
+#   但 from=1&to=2 仍能查到当时的临时改写及其提议——修订链逐版追踪，不按同文搜索配对。
+
+# 3) 参与者查看当前保密段：只见占位，不获得该段文字、变化数量或提议信息
+curl -s -b /tmp/par.cookie "http://localhost:3000/api/version-diff?from=1&to=3"
+#   changedSegments/totalChanges 均已剔除保密段；该段仅返回：
+#   { "seg": 7, "secret": true, "text": "该段已按段号保密",
+#     "oldLength": null, "newLength": null, "changes": [] }
+# 复核员/记录员在保密期间仍看到真实区间、文字与提议；解除保密后参与者同一请求立即恢复。
+
+# 4) 失败场景：明确拒绝，且查询只读（不改写版本、决议或保密状态）
+curl -s -b /tmp/rec.cookie "http://localhost:3000/api/version-diff?from=3&to=1"
+#   409 {"error":"版本顺序不合法：旧版必须严格早于新版（from < to），本次 from=v3、to=v1 …",
+#        "code":"BAD_VERSION_ORDER"}
+curl -s -b /tmp/rec.cookie "http://localhost:3000/api/version-diff?from=1&to=2"
+#   409 {"error":"版本顺序不合法：…from=v2、to=v2…","code":"BAD_VERSION_ORDER"}   # 两版相同
+curl -s -b /tmp/rec.cookie "http://localhost:3000/api/version-diff?from=1&to=999"
+#   404 {"error":"新版 v999 不存在，无法对照","code":"NOT_FOUND"}
+curl -s -b /tmp/rec.cookie "http://localhost:3000/api/version-diff?from=abc&to=3"
+#   400 {"error":"缺少有效的版本号：from 与 to 必须为已发布版本的整数编号",…}
+curl -s "http://localhost:3000/api/version-diff?from=1&to=3"
+#   401 {"error":"未登录或会话已过期","code":"UNAUTHENTICATED"}
+```
+
+> 网页操作：右侧“版本”面板顶部“两版净变化对照”选择旧版 → 新版后点击“对照净变化”，
+> 弹窗按段列出旧版/新版区间与文字、以及促成每处变化的提议编号与发布版本；
+> 参与者对当前保密段只看到占位行。该功能与现有“只读查看版本”“按段来源”并存，互不影响。
+
+> 对照口径（与“正文来源”同一套几何重放，而非同文配对）：以 v1 该段原文为起点，给每个码点一个
+> 稳定身份（初始码点为 `i<下标>`；修订插入/重写的码点为 `p<提议号>-<序号>`，身份归该提议）。
+> 重放到旧版与新版时**共享同一插入序号**，故任一已发布提议的码点在两条链中身份一致；身份只由
+> 每次发布的 `prefix + 替换码点 + suffix` 切片产生。对照时按身份做对齐：两版共有码点为未变锚点，
+> 只在旧版出现的为删除、只在新版出现的为新增；删除块的删除方取“在 `(from,to]` 区间内移除该身份
+> 的提议”，新增块的写入方取该码点的最后写入提议。连续的删/增合并为一块，**整块两端文字相同即视为
+> 中途改回、无净变化而剔除**（这是基于几何整块边界的判定，不是跨段同文搜索）。服务端还会校验两版
+> 重放文本与各自不可变快照逐码点一致，不一致（数据损坏）时报错而非编造对照。
+
 ### 依据附件调用示例（curl）
 
 ```bash
@@ -446,6 +525,11 @@ curl -s -b /tmp/rec.cookie -X DELETE http://localhost:3000/api/attachments/3
   附件冻结与否不额外建列——由所属 `proposals.status` 实时决定（仅 `pending` 可增删）；
   删除是硬删除（同时移除磁盘文件），保留的附件随提议与历史决议永久留存；续提只新建提议，不复制附件行。
 
+> **两版净变化不新增任何表或列**：它复用 `versions.segments_json`（不可变端点快照）与 `proposals`
+> 中 `status='published'` 记录的发布版本（`published_version_id`）、段号与码点坐标，在查询时由
+> `text.js` 的码点身份重放（`replayIdentityTo` / `replayIdentityContinuation`）与身份对齐
+> （`alignIdentityTokens` / `diffHunks`）即时算出。对照为只读，不写入、不迁移任何数据。
+
 ---
 
 ## 七、目录结构
@@ -461,9 +545,9 @@ curl -s -b /tmp/rec.cookie -X DELETE http://localhost:3000/api/attachments/3
 │   ├── server.js            # Express 路由与错误出口（含附件原始字节上传/下载）
 │   ├── auth.js              # Cookie 会话与角色鉴权
 │   ├── db.js                # SQLite 连接、建表、种子账户
-│   ├── store.js             # 业务核心：导入/提议/复核/发布/续提/异议/版本视图/正文来源/附件权限
+│   ├── store.js             # 业务核心：导入/提议/复核/发布/续提/异议/版本视图/正文来源/两版净变化/附件权限
 │   ├── attachments.js       # 依据附件：内容类型嗅探、SHA-256、临时文件原子落盘
-│   └── text.js              # 码点偏移、范围校验、合版、引用映射、续提换算、来源重放
+│   └── text.js              # 码点偏移、范围校验、合版、引用映射、续提换算、来源重放、码点身份对齐与两版净变化
 ├── public                   # 浏览器前端（原生 HTML/CSS/JS，无构建步骤）
 │   ├── index.html
 │   ├── styles.css

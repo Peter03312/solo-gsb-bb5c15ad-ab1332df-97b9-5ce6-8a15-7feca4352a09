@@ -934,6 +934,131 @@ async function main() {
   ok(srcBack.fragments.some((f) => f.source === 'proposal'),
     '解除保密后参与者重新获得该段来源（含历史修订产生的提议来源）');
 
+  // ====================================================================
+  // 两版净变化对照（GET /api/version-diff）：身份沿逐次发布坐标映射对齐，
+  // 不按同文搜索配对；中途改回的整块不算变化；保密段参与者只见占位。
+  // ====================================================================
+  console.log('\n[两版净变化：发布两个独立段的确定性修订用于对照]');
+  // 以当前最新版本为起点，分别在第4段（净替换）与第1段（改回原文）各发布一版，
+  // 用独立段避免与前面流程交织；段号跨版本不变。
+  const vDiff0 = (await req('GET', '/api/booth', null, rec)).json.currentVersion.id;
+  const vAt = async (id) => (await req('GET', `/api/versions/${id}`, null, rec)).json;
+  const textOf = async (id, seg) => (await vAt(id)).segments.find((s) => s.seg === seg).text;
+  const cpArr = (s) => Array.from(s);
+  const cpIndex = (s, needle) => { const t = cpArr(s), n = cpArr(needle); outer: for (let a = 0; a + n.length <= t.length; a++) { for (let b = 0; b < n.length; b++) if (t[a + b] !== n[b]) continue outer; return a; } return -1; };
+
+  // 第4段：把“现场”改为“当场”（确定性净替换）
+  const seg4base = await textOf(vDiff0, 4);
+  const iXc = cpIndex(seg4base, '现场');
+  assert.ok(iXc >= 0, '对照基线第4段应含“现场”');
+  const dq1 = await req('POST', '/api/proposals',
+    { seg: 4, start: iXc, end: iXc + 2, replacement: '当场', basis: '对照测试：净替换' }, rec);
+  assert.strictEqual(dq1.status, 201);
+  const dq1Id = dq1.json.id;
+  await req('POST', `/api/proposals/${dq1Id}/adopt`, {}, rev);
+  await clearGate(rev);
+  const pubD1 = await req('POST', '/api/publish', { note: '对照测试：现场->当场' }, rev);
+  assert.strictEqual(pubD1.status, 201, pubD1.json.error);
+  const vDiff1 = pubD1.json.versionId;
+
+  // 第1段：把首字改为 X，下一版再改回原字（中途改动最终撤销，两端同文不算变化）
+  const seg1base = await textOf(vDiff1, 1);
+  const firstCh = cpArr(seg1base)[0];
+  const dr1 = await req('POST', '/api/proposals',
+    { seg: 1, start: 0, end: 1, replacement: 'Ｘ', basis: '对照测试：临时改写' }, rec);
+  assert.strictEqual(dr1.status, 201);
+  const dr1Id = dr1.json.id;
+  await req('POST', `/api/proposals/${dr1Id}/adopt`, {}, rev);
+  await clearGate(rev);
+  const pubD2 = await req('POST', '/api/publish', { note: '对照测试：首字临时改写' }, rev);
+  assert.strictEqual(pubD2.status, 201, pubD2.json.error);
+  const vDiff2 = pubD2.json.versionId;
+  // 再改回原字
+  const dr2 = await req('POST', '/api/proposals',
+    { seg: 1, start: 0, end: 1, replacement: firstCh, basis: '对照测试：改回原文' }, rec);
+  assert.strictEqual(dr2.status, 201);
+  const dr2Id = dr2.json.id;
+  await req('POST', `/api/proposals/${dr2Id}/adopt`, {}, rev);
+  await clearGate(rev);
+  const pubD3 = await req('POST', '/api/publish', { note: '对照测试：首字改回' }, rev);
+  assert.strictEqual(pubD3.status, 201, pubD3.json.error);
+  const vDiff3 = pubD3.json.versionId;
+
+  console.log('[两版净变化：旧版/新版区间、文字与促成提议]');
+  let diff = (await req('GET', `/api/version-diff?from=${vDiff0}&to=${vDiff1}`, null, rec)).json;
+  assert.strictEqual(diff.fromVersion.id, vDiff0);
+  assert.strictEqual(diff.toVersion.id, vDiff1);
+  let seg4diff = diff.segments.find((s) => s.seg === 4);
+  ok(!!seg4diff && seg4diff.changes.length === 1, `第4段恰好 1 处净变化（实际 ${seg4diff ? seg4diff.changes.length : '无该段'}）`);
+  const ch4 = seg4diff.changes[0];
+  ok(ch4.oldText === '现场' && ch4.newText === '当场', '净变化给出旧版文字“现场”与新版文字“当场”');
+  ok(ch4.oldStart === iXc && ch4.oldEnd === iXc + 2 && ch4.newStart === iXc && ch4.newEnd === iXc + 2,
+    '旧/新区间均为该段 Unicode 码点半开区间（emoji 同口径）');
+  ok(ch4.proposals.length === 1 && ch4.proposals[0].proposalId === dq1Id &&
+     ch4.proposals[0].versionId === vDiff1,
+     `促成该变化的跨版已发布提议为 #${dq1Id}（随 v${vDiff1} 发布）`);
+  // 未变段（第2/3/5段）不出现在 segments 中
+  ok(!diff.segments.some((s) => s.seg === 2 || s.seg === 3 || s.seg === 5),
+    '未变段不列变化：segments 中只含有净变化的第4段');
+
+  console.log('[两版净变化：中途改动最终撤销、两端同文不算变化]');
+  // vDiff1 -> vDiff3：第1段首字先改 X 再改回，两端文字相同 → 第1段不产生变化
+  diff = (await req('GET', `/api/version-diff?from=${vDiff1}&to=${vDiff3}`, null, rec)).json;
+  ok(diff.changedSegments === 0 && diff.totalChanges === 0 && diff.segments.length === 0,
+    `第1段首字临时改写后改回，两端同文不算变化（changedSegments=${diff.changedSegments}）`);
+  // 但中间版本 vDiff2 确实含临时改写：vDiff1->vDiff2 应能查到该变化（修订链追踪，不靠同文猜测）
+  diff = (await req('GET', `/api/version-diff?from=${vDiff1}&to=${vDiff2}`, null, rec)).json;
+  const seg1mid = diff.segments.find((s) => s.seg === 1);
+  ok(!!seg1mid && seg1mid.changes.length === 1 &&
+     seg1mid.changes[0].oldText === firstCh && seg1mid.changes[0].newText === 'Ｘ' &&
+     seg1mid.changes[0].proposals[0].proposalId === dr1Id,
+    '中间版本确有临时改写：v1→v2 对照给出该变化与提议 #' + dr1Id);
+
+  console.log('[两版净变化：跨多版仍沿修订链追踪，重复文字不靠搜索配对]');
+  // vDiff0 -> vDiff3：第4段净替换保留（跨3个版本），第1段改回不算；只列第4段
+  diff = (await req('GET', `/api/version-diff?from=${vDiff0}&to=${vDiff3}`, null, rec)).json;
+  seg4diff = diff.segments.find((s) => s.seg === 4);
+  ok(diff.segments.filter((s) => !s.secret).length === 1 && seg4diff && seg4diff.changes[0].newText === '当场',
+    '跨多版对照：第4段净替换仍被追踪，第1段改回被剔除，不靠同文搜索');
+
+  console.log('[两版净变化：工作人员均可见，参与者在保密段只见占位]');
+  // 工作人员（复核员）可见同样结果
+  const diffRev = (await req('GET', `/api/version-diff?from=${vDiff0}&to=${vDiff1}`, null, rev)).json;
+  ok(!!diffRev.segments.find((s) => s.seg === 4), '复核员可查看净变化对照');
+  // 参与者在非保密段正常查看
+  const diffPar0 = (await req('GET', `/api/version-diff?from=${vDiff0}&to=${vDiff1}`, null, par)).json;
+  ok(!!diffPar0.segments.find((s) => s.seg === 4), '参与者可查看非保密段净变化');
+  // 把第4段设为保密：参与者只见占位，不获得该段文字、变化数量或提议信息；计数也剔除该段
+  await req('POST', '/api/segments/4/secret', {}, rev);
+  const diffPar = (await req('GET', `/api/version-diff?from=${vDiff0}&to=${vDiff1}`, null, par)).json;
+  const secEntry = diffPar.segments.find((s) => s.seg === 4);
+  ok(!!secEntry && secEntry.secret === true && secEntry.text === '该段已按段号保密' &&
+     (!secEntry.changes || secEntry.changes.length === 0) && secEntry.oldLength === null,
+     '参与者对当前保密段只见占位，不获得该段文字、变化数量或提议信息');
+  ok(diffPar.changedSegments === 0 && diffPar.totalChanges === 0,
+     '参与者视角的统计计数不含保密段变化');
+  // 工作人员在保密期间仍看到真实变化
+  const diffStaffSec = (await req('GET', `/api/version-diff?from=${vDiff0}&to=${vDiff1}`, null, rev)).json;
+  const staff4 = diffStaffSec.segments.find((s) => s.seg === 4);
+  ok(staff4 && !staff4.secret && staff4.changes[0].newText === '当场', '工作人员按现有权限在保密期间仍查看真实变化');
+  // 解除保密后参与者可重查
+  await req('POST', '/api/segments/4/unsecret', {}, rev);
+  const diffParBack = (await req('GET', `/api/version-diff?from=${vDiff0}&to=${vDiff1}`, null, par)).json;
+  ok(!!diffParBack.segments.find((s) => s.seg === 4 && !s.secret && s.changes[0].newText === '当场'),
+    '解除保密后参与者重新可查该段净变化');
+
+  console.log('[两版净变化：未导入/版本不存在/顺序不合法明确拒绝，且不改写状态]');
+  await expectFail(req('GET', '/api/version-diff?from=1&to=9999', null, rec), 404, '不存在', '新版不存在');
+  await expectFail(req('GET', '/api/version-diff?from=9999&to=' + vDiff1, null, rec), 404, '不存在', '旧版不存在');
+  await expectFail(req('GET', `/api/version-diff?from=${vDiff1}&to=${vDiff0}`, null, rec), 409, '顺序', '旧版晚于新版');
+  await expectFail(req('GET', `/api/version-diff?from=${vDiff1}&to=${vDiff1}`, null, rec), 409, '顺序', '两版相同');
+  await expectFail(req('GET', `/api/version-diff?from=1&to=${vDiff1}`), 401, '未登录', '未登录对照');
+  await expectFail(req('GET', '/api/version-diff?from=abc&to=' + vDiff1, null, rec), 400, '版本号', '版本号非整数');
+  // 被拒查询不改写版本/保密状态：最新版本与保密段集合不变
+  const boothAfter = (await req('GET', '/api/booth', null, rev)).json;
+  ok(boothAfter.currentVersion.id === vDiff3 && !boothAfter.secretSegs.includes(4),
+     '非法/越权对照查询不改写版本、决议或保密状态');
+
   console.log(`\n全部通过：${passed} 项断言 ✅`);
   process.exit(0);
 }
