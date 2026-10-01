@@ -2,7 +2,7 @@
 // 纯文本算子单元测试（码点偏移、合版、引用映射、续提换算）
 const assert = require('assert');
 const crypto = require('crypto');
-const { codeLength, sliceCP, validateRange, applyEdits, transformRange, transformRangeRebase, editTouchesAnchor, replayProvenance } = require('../src/text');
+const { codeLength, sliceCP, validateRange, applyEdits, transformRange, transformRangeRebase, editTouchesAnchor, replayProvenance, diffLineage } = require('../src/text');
 const { parseTranscript } = require('../src/store');
 const { sniffMediaType, sha256, MEDIA_TYPES, formatBytes } = require('../src/attachments');
 
@@ -170,6 +170,123 @@ tk = replayProvenance('甲乙', [
 ]);
 ok(tk.map((t) => t.ch).join('') === '甲RL乙' && tk[1].tag.proposalId === 2 && tk[2].tag.proposalId === 1,
   '来源重放：同点零长度插入按合版实际顺序归属（后应用的 #2 文本在左、#1 在右）');
+
+// ---------- 跨版净变化（diffLineage） ----------
+function diffHunks(initial, steps, a, b) {
+  return diffLineage(initial, steps, a, b).hunks;
+}
+function contribIds(hunks) {
+  return hunks.map((h) => h.contributors.map((c) => `#${c.proposalId}@v${c.versionId}`).join(','));
+}
+
+// 单步替换：旧/新区间、文字与促成提议
+let dh = diffHunks('甲乙丙丁', [{ version: 2, edits: [{ id: 1, start: 0, end: 1, replace: 'X' }] }], 1, 2);
+ok(dh.length === 1 && dh[0].kind === 'replace' &&
+   dh[0].old.text === '甲' && dh[0].now.text === 'X' &&
+   dh[0].old.start === 0 && dh[0].now.start === 0 &&
+   contribIds(dh)[0] === '#1@v2', '净变化：单步替换给出旧/新半开区间、文字与促成提议');
+
+// 纯插入：旧为空区间（插入点），新区间为插入码点；归因正确
+dh = diffHunks('甲乙', [{ version: 2, edits: [{ id: 3, start: 1, end: 1, replace: '插' }] }], 1, 2);
+ok(dh.length === 1 && dh[0].kind === 'insert' &&
+   dh[0].old.start === 1 && dh[0].old.end === 1 && dh[0].old.text === '' &&
+   dh[0].now.start === 1 && dh[0].now.end === 2 && dh[0].now.text === '插' &&
+   contribIds(dh)[0] === '#3@v2', '净变化：纯插入旧区间为空、新区间为插入码点');
+
+// 纯删除：新区间为空（删除点），旧区间为被删码点
+dh = diffHunks('甲乙丙', [{ version: 2, edits: [{ id: 4, start: 1, end: 2, replace: '' }] }], 1, 2);
+ok(dh.length === 1 && dh[0].kind === 'delete' &&
+   dh[0].old.text === '乙' && dh[0].now.text === '' &&
+   dh[0].old.start === 1 && dh[0].old.end === 2 &&
+   dh[0].now.start === 1 && dh[0].now.end === 1 &&
+   contribIds(dh)[0] === '#4@v2', '净变化：纯删除新区间为空、旧区间为被删码点');
+
+// 中途改动最终撤销、两端文字相同（同位置整块替换）：不算变化
+dh = diffHunks('甲', [
+  { version: 2, edits: [{ id: 1, start: 0, end: 1, replace: 'X' }] },
+  { version: 3, edits: [{ id: 2, start: 0, end: 1, replace: '甲' }] },
+], 1, 3);
+ok(dh.length === 0, '净变化：甲→X→甲 中途撤销且两端相同，不计变化');
+// 同版单步把文字换成完全相同文字（重写）：两端相同，不算净变化
+dh = diffHunks('甲乙', [{ version: 2, edits: [{ id: 9, start: 0, end: 2, replace: '甲乙' }] }], 1, 2);
+ok(dh.length === 0, '净变化：同位置同文重写不算净变化');
+// 插入后又删除该插入（两端相同）：不算变化，不泄露曾插入的内容
+dh = diffHunks('甲乙', [
+  { version: 2, edits: [{ id: 1, start: 1, end: 1, replace: 'X' }] },
+  { version: 3, edits: [{ id: 2, start: 1, end: 2, replace: '' }] },
+], 1, 3);
+ok(dh.length === 0, '净变化：插入 X 后又删除 X，两端相同不计变化');
+
+// 但中途区间仍可查：1→2 只见第一次改动（归因不含区间外 v3 的提议）
+dh = diffHunks('甲', [
+  { version: 2, edits: [{ id: 1, start: 0, end: 1, replace: 'X' }] },
+  { version: 3, edits: [{ id: 2, start: 0, end: 1, replace: '甲' }] },
+], 1, 2);
+ok(dh.length === 1 && dh[0].now.text === 'X' && contribIds(dh)[0] === '#1@v2',
+  '净变化：1→2 对照只归因区间内 v2 的提议，不含区间外 v3');
+// 2→3
+dh = diffHunks('甲', [
+  { version: 2, edits: [{ id: 1, start: 0, end: 1, replace: 'X' }] },
+  { version: 3, edits: [{ id: 2, start: 0, end: 1, replace: '甲' }] },
+], 2, 3);
+ok(dh.length === 1 && dh[0].old.text === 'X' && dh[0].now.text === '甲' && contribIds(dh)[0] === '#2@v3',
+  '净变化：2→3 对照给出撤销改动');
+
+// 重复文字不得靠搜索配对：删旧 b 又在段尾另插新 b（两处位置不同的独立修订，结果 acb），
+// 必须报为两处净变化，不能配成“移动”或无变化。
+dh = diffHunks('abc', [{ version: 2, edits: [
+  { id: 1, start: 1, end: 2, replace: '' },   // 删位置1的 b
+  { id: 2, start: 3, end: 3, replace: 'b' },  // 段尾另插新 b
+] }], 1, 2);
+ok(dh.length === 2,
+  `净变化：删旧 b + 段尾插新 b（结果 acb）报为两处变化（实际 ${dh.length}），不按同文配对`);
+ok(dh.some((h) => h.kind === 'delete' && h.old.text === 'b' && h.old.start === 1) &&
+   dh.some((h) => h.kind === 'insert' && h.now.text === 'b' && h.now.start === 2),
+  '净变化：两处分别为删除旧 b 与插入新 b，归因各属其提议');
+// 开头插入重复 a：新 a 不顶替旧 a，只报一处插入
+dh = diffHunks('ab', [{ version: 2, edits: [{ id: 3, start: 0, end: 0, replace: 'a' }] }], 1, 2);
+ok(dh.length === 1 && dh[0].kind === 'insert' && dh[0].now.start === 0 && dh[0].now.end === 1,
+  '净变化：开头插入重复 a 不顶替旧 a（几何对齐，不按同文搜索）');
+
+// 链式跨版：ABC →(v2 #1) XYZ →(v3 #2) XQZ；对照 1→3 为一块，归因含两个跨版提议
+dh = diffHunks('ABC', [
+  { version: 2, edits: [{ id: 1, start: 0, end: 3, replace: 'XYZ' }] },
+  { version: 3, edits: [{ id: 2, start: 1, end: 2, replace: 'Q' }] },
+], 1, 3);
+ok(dh.length === 1 && dh[0].old.text === 'ABC' && dh[0].now.text === 'XQZ' &&
+   contribIds(dh)[0] === '#1@v2,#2@v3',
+  '净变化：链式改写 1→3 为一块，促成提议含跨版 #1@v2 与 #2@v3');
+// 2→3 只见第二步
+dh = diffHunks('ABC', [
+  { version: 2, edits: [{ id: 1, start: 0, end: 3, replace: 'XYZ' }] },
+  { version: 3, edits: [{ id: 2, start: 1, end: 2, replace: 'Q' }] },
+], 2, 3);
+ok(dh.length === 1 && dh[0].old.text === 'Y' && dh[0].now.text === 'Q' && contribIds(dh)[0] === '#2@v3',
+  '净变化：2→3 只报并归因第二步修订');
+
+// 两处不相邻修订（删除 + 段尾插入）产生两块，半开区间坐标各自正确
+dh = diffHunks('甲乙丙丁', [{ version: 2, edits: [
+  { id: 1, start: 0, end: 1, replace: '' },
+  { id: 2, start: 3, end: 3, replace: '尾' },
+] }], 1, 2);
+ok(dh.length === 2 && dh[0].kind === 'delete' && dh[0].old.start === 0 &&
+   dh[1].kind === 'insert' && dh[1].now.text === '尾',
+  '净变化：删除首字与段尾插入分属两块');
+
+// 未变段（版本发布了其他段的修订，但该段在 a→b 区间无任何步骤）：不产生变化块
+dh = diffHunks('无改动段落', [], 1, 2);
+ok(dh.length === 0 && diffLineage('无改动段落', [], 1, 2).versions[2] === '无改动段落',
+  '净变化：区间内该段无修订不产生变化块，快照文本不变');
+
+// emoji 按 1 码点：替换 😀 区间为 [1,2)
+{
+  const r = diffLineage('a😀b', [{ version: 2, edits: [{ id: 7, start: 1, end: 2, replace: '🙂' }] }], 1, 2);
+  ok(r.hunks.length === 1 && r.hunks[0].old.start === 1 && r.hunks[0].old.end === 2 &&
+     r.hunks[0].old.text === '😀' && r.hunks[0].now.text === '🙂',
+    '净变化：增补平面字符按 1 码点计区间');
+  // 各版本快照文本正确
+  ok(r.versions[1] === 'a😀b' && r.versions[2] === 'a🙂b', '净变化：版本快照文本正确（含 emoji）');
+}
 
 // ---------- 附件内容嗅探：只认文件内容，不认后缀/客户端声明类型 ----------
 const png1x1 = Buffer.from(

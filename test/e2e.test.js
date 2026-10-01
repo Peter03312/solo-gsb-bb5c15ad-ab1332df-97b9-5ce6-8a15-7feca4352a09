@@ -934,6 +934,175 @@ async function main() {
   ok(srcBack.fragments.some((f) => f.source === 'proposal'),
     '解除保密后参与者重新获得该段来源（含历史修订产生的提议来源）');
 
+  console.log('\n[跨版净变化对照 /api/diff]');
+  { // 独立块作用域，避免与上文大量测试变量同名
+  // 辅助：采纳一组提议、过门槛、发布
+  async function adoptAndPublish(ids, note) {
+    for (const id of ids) {
+      const ad = await req('POST', `/api/proposals/${id}/adopt`, {}, rev);
+      assert.strictEqual(ad.status, 200, `采纳 #${id} 失败: ${JSON.stringify(ad.json)}`);
+    }
+    await clearGate(rev);
+    const pub = await req('POST', '/api/publish', { note }, rev);
+    assert.strictEqual(pub.status, 201, `发布失败: ${JSON.stringify(pub.json)}`);
+    return pub.json.versionId;
+  }
+  const segOfDiff = (j, d) => d.segments.find((x) => x.seg === j);
+  const segTextAt = async (vid, j, cookie = rec) =>
+    (await req('GET', `/api/versions/${vid}`, null, cookie)).json.segments.find((x) => x.seg === j).text;
+
+  // —— 准备多版本历史 ——
+  // 第4段此前在其他用例已由“王五”改为“王武”；此处基于当前正文继续构造
+  booth = (await req('GET', '/api/booth', null, rec)).json;
+  const dSeg4Text = booth.segments.find((s) => s.seg === 4).text;
+  const dAfternoon = cpIndexOf(dSeg4Text, '当天下午');
+  const dWang0 = cpIndexOf(dSeg4Text, '王武');
+  ok(dAfternoon >= 0 && dWang0 >= 0, `定位第4段“当天下午”@${dAfternoon} “王武”@${dWang0}`);
+
+  // vD1：第4段 “当天下午” -> “当日下午”（等长替换）
+  const vBeforeD1 = (await req('GET', '/api/booth', null, rec)).json.currentVersion.id;
+  const d1 = await req('POST', '/api/proposals',
+    { seg: 4, start: dAfternoon, end: dAfternoon + 4, replacement: '当日下午', basis: '对照测试：当天→当日' }, rec);
+  assert.strictEqual(d1.status, 201);
+  const vD1 = await adoptAndPublish([d1.json.id], '对照测试：当天下午→当日下午');
+
+  // vD2：第4段 “王武” -> “王某某”（不等长替换）
+  booth = (await req('GET', '/api/booth', null, rec)).json;
+  let dT4 = booth.segments.find((s) => s.seg === 4).text;
+  const dWang02 = cpIndexOf(dT4, '王武');
+  const d2 = await req('POST', '/api/proposals',
+    { seg: 4, start: dWang02, end: dWang02 + 2, replacement: '王某某', basis: '对照测试：王武→王某某' }, rec);
+  assert.strictEqual(d2.status, 201);
+  const vD2 = await adoptAndPublish([d2.json.id], '对照测试：王武→王某某');
+
+  // —— 未登录/参数校验 ——
+  await expectFail(req('GET', `/api/diff?from=1&to=${vD2}`), 401, '未登录', '未登录查看对照');
+  await expectFail(req('GET', '/api/diff?from=2&to=2', null, rec), 409, '顺序不合法', 'from=to');
+  await expectFail(req('GET', '/api/diff?from=3&to=2', null, rec), 409, '顺序不合法', 'from>to');
+  await expectFail(req('GET', '/api/diff?from=1&to=999', null, rec), 404, '不存在', '新版不存在');
+  await expectFail(req('GET', '/api/diff?from=999&to=1000', null, rec), 404, '不存在', '旧版不存在');
+  await expectFail(req('GET', '/api/diff', null, rec), 400, '版本号', '缺少版本参数');
+
+  // —— vBeforeD1 → vD1（相邻版本）：一处替换，区间/文字/促成提议正确 ——
+  let diff = (await req('GET', `/api/diff?from=${vBeforeD1}&to=${vD1}`, null, rec)).json;
+  let s4 = segOfDiff(4, diff);
+  ok(diff.changeCount === 1 && diff.changedSegments === 1 && s4.changeCount === 1,
+    `v${vBeforeD1}→v${vD1}：第4段 1 处净变化（共 ${diff.changeCount} 处）`);
+  let h = s4.changes[0];
+  ok(h.old.text === '当天下午' && h.now.text === '当日下午' &&
+     h.old.start === dAfternoon && h.now.start === dAfternoon &&
+     h.contributors.length === 1 && h.contributors[0].proposalId === d1.json.id &&
+     h.contributors[0].versionId === vD1,
+    '相邻版：旧/新区间文字为“当天下午/当日下午”，促成提议为 #d1 随该版发布');
+  // 半开区间拼接还原两版正文（旧/新两侧）
+  for (const s of diff.segments.filter((x) => !x.secret)) {
+    const oldRec = s.changes.map((c) => c.old);
+    const newRec = s.changes.map((c) => c.now);
+    const cover = (text, rs) => {
+      const cps = Array.from(text);
+      let p = 0;
+      for (const r of rs.slice().sort((a, b) => a.start - b.start)) {
+        if (r.end === r.start) { if (r.start < p || r.start > cps.length) return false; p = Math.max(p, r.start); continue; }
+        if (r.start < p || r.end > cps.length) return false;
+        p = r.end;
+      }
+      return true;
+    };
+    ok(cover(s.oldText, oldRec) && cover(s.newText, newRec), `第${s.seg}段：各变化区间不越界且不重叠`);
+  }
+
+  // —— vD1 → vD2：只见第二步改动并只归因 #d2 ——
+  diff = (await req('GET', `/api/diff?from=${vD1}&to=${vD2}`, null, rec)).json;
+  s4 = segOfDiff(4, diff);
+  ok(s4.changeCount === 1, `vD1→vD2：第4段 1 处净变化（实际 ${s4.changeCount}）`);
+  h = s4.changes[0];
+  ok(h.old.text === '王武' && h.now.text === '王某某' &&
+     h.contributors.length === 1 && h.contributors[0].proposalId === d2.json.id &&
+     h.contributors[0].versionId === vD2,
+    'vD1→vD2：旧/新文字“王武/王某某”，归因只含区间内 #d2（不含区间外 #d1）');
+
+  // —— vBeforeD1 → vD2：两处变化（不同位置）；未变段 changeCount=0 且可拿到两版全文 ——
+  diff = (await req('GET', `/api/diff?from=${vBeforeD1}&to=${vD2}`, null, rec)).json;
+  s4 = segOfDiff(4, diff);
+  ok(s4.changeCount === 2, `两步对照：第4段 2 处净变化（实际 ${s4.changeCount}）`);
+  const texts = s4.changes.map((c) => `${c.old.text}->${c.now.text}`).join('|');
+  ok(texts.includes('当天下午->当日下午') && texts.includes('王武->王某某'),
+    `两步对照：两处净变化文字正确（${texts}），各归其跨版提议`);
+  ok(s4.changes.every((c) => c.contributors.length === 1), '两步对照：两处变化各由一个区间内提议促成');
+  const s1 = segOfDiff(1, diff);
+  ok(s1 && s1.secret === false && s1.changeCount === 0 && !!s1.oldText && !!s1.newText &&
+     s1.oldText === s1.newText,
+    '两步对照：未变段（第1段）changeCount=0，仍下发两版正文供并排查看');
+
+  // —— 撤销闭环：第3段稳定片段“李四辩”先改成“某某辩”再改回，跨该区间对照净变化为 0 ——
+  booth = (await req('GET', '/api/booth', null, rec)).json;
+  dT4 = booth.segments.find((s) => s.seg === 3).text;
+  const dDate0 = cpIndexOf(dT4, '李四辩');
+  ok(dDate0 >= 0, `定位第3段“李四辩”@${dDate0}`);
+  const rev1 = await req('POST', '/api/proposals',
+    { seg: 3, start: dDate0, end: dDate0 + 3, replacement: '某某辩', basis: '对照测试：先改成不同文字' }, rec);
+  assert.strictEqual(rev1.status, 201, `rev1 提交失败: ${JSON.stringify(rev1.json)}`);
+  const vR1 = await adoptAndPublish([rev1.json.id], '对照测试：李四辩→某某辩');
+  const tAfterR1 = await segTextAt(vR1, 3);
+  const dDate0R = cpIndexOf(tAfterR1, '某某辩');
+  const rev2 = await req('POST', '/api/proposals',
+    { seg: 3, start: dDate0R, end: dDate0R + 3, replacement: '李四辩', basis: '对照测试：改回原文' }, rec);
+  assert.strictEqual(rev2.status, 201, `rev2 提交失败: ${JSON.stringify(rev2.json)}`);
+  const vR2 = await adoptAndPublish([rev2.json.id], '对照测试：某某辩改回 李四辩');
+  diff = (await req('GET', `/api/diff?from=${vD2}&to=${vR2}`, null, rec)).json;
+  const s2rev = segOfDiff(3, diff);
+  ok(s2rev.changeCount === 0 && s2rev.oldText === s2rev.newText && s2rev.oldText.includes('李四辩'),
+    '撤销闭环：李四辩→某某辩→李四辩，跨区间对照该段 0 处净变化（中途撤销且两端相同）');
+  // 但中间版本 vR1 相对 vD2 仍能查到那处真实改动
+  diff = (await req('GET', `/api/diff?from=${vD2}&to=${vR1}`, null, rec)).json;
+  const s2mid = segOfDiff(3, diff);
+  ok(s2mid.changeCount === 1 && s2mid.changes[0].now.text === '某某辩' &&
+     s2mid.changes[0].contributors[0].proposalId === rev1.json.id,
+    '撤销闭环：对照到中途版本 vR1 仍显示“某某辩”那处改动（历史不可变、可查）');
+
+  // —— 重复文字：删某字又在段尾插同字（两处独立修订），必须报两处而非配成无变化 ——
+  booth = (await req('GET', '/api/booth', null, rec)).json;
+  const dT1 = booth.segments.find((s) => s.seg === 1).text;
+  const dupDel = await req('POST', '/api/proposals',
+    { seg: 1, start: 1, end: 2, replacement: '', basis: '对照测试：删除第2个字' }, rec);
+  const dupIns = await req('POST', '/api/proposals',
+    { seg: 1, start: dT1.length, end: dT1.length, replacement: Array.from(dT1)[1], basis: '对照测试：段尾插入同字' }, rec);
+  const vDup = await adoptAndPublish([dupDel.json.id, dupIns.json.id], '对照测试：删字+段尾插同字');
+  diff = (await req('GET', `/api/diff?from=${vR2}&to=${vDup}`, null, par)).json;
+  const s1dup = segOfDiff(1, diff);
+  const dupTextNew = await segTextAt(vDup, 1, par);
+  ok(s1dup.changeCount === 2 && dupTextNew !== dT1,
+    `重复文字：删字+段尾插同字报 2 处净变化（实际 ${s1dup.changeCount}），不按同文搜索配对`);
+  ok(s1dup.changes.some((c) => c.kind === 'delete') && s1dup.changes.some((c) => c.kind === 'insert'),
+    '重复文字：两处分别为删除与插入，各归其提议');
+
+  // —— 保密段：参与者只见占位，不获得文字、变化数量或提议信息；工作人员正常 ——
+  await req('POST', '/api/segments/4/secret', {}, rev);
+  diff = (await req('GET', `/api/diff?from=${vBeforeD1}&to=${vD2}`, null, par)).json;
+  const s4sec = segOfDiff(4, diff);
+  ok(s4sec.secret === true && s4sec.text === '该段已按段号保密' &&
+     s4sec.changes.length === 0 && s4sec.changeCount === 0 &&
+     JSON.stringify(s4sec).indexOf('当日') === -1 && JSON.stringify(s4sec).indexOf('proposalId') === -1,
+    '参与者对照：当前保密段只见占位，不获得文字、变化数量或提议信息');
+  // 顶层计数也不计入保密段
+  const visibleChanged = diff.segments.filter((x) => !x.secret && x.changeCount > 0).length;
+  ok(diff.changedSegments === visibleChanged, '参与者对照：顶层变化段数不含保密段');
+  // 工作人员不受影响
+  diff = (await req('GET', `/api/diff?from=${vBeforeD1}&to=${vD2}`, null, rec)).json;
+  const s4staff = segOfDiff(4, diff);
+  ok(s4staff.secret === false && s4staff.changeCount === 2 && s4staff.changes[0].now.text !== undefined,
+    '工作人员对照：保密段仍可见真实净变化与提议（按现有权限）');
+  // 解除保密后参与者可重查
+  await req('POST', '/api/segments/4/unsecret', {}, rev);
+  diff = (await req('GET', `/api/diff?from=${vBeforeD1}&to=${vD2}`, null, par)).json;
+  ok(segOfDiff(4, diff).secret === false && segOfDiff(4, diff).changeCount === 2,
+    '解除保密后参与者重新对照即恢复该段净变化与提议信息');
+
+  // —— 只读：对照后版本/决议/保密状态不变（版本数未增） ——
+  booth = (await req('GET', '/api/booth', null, rec)).json;
+  ok(booth.currentVersion.id === vDup, '对照查询为只读：当前版本仍为对照前版本，未改写任何状态');
+  } // /跨版净变化对照块作用域
+
   console.log(`\n全部通过：${passed} 项断言 ✅`);
   process.exit(0);
 }

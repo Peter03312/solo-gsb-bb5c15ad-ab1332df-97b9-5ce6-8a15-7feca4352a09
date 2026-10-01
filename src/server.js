@@ -156,6 +156,15 @@ app.get('/api/versions/:id/sources/:seg', requireAuth, wrap((req, res) => {
   ));
 }));
 
+// ---------- 跨版净变化对照（两个按时间先后排列的已发布版本，按段对照） ----------
+// GET /api/diff?from=A&to=B（A、B 均为已发布版本且 A < B）；只读，不改写任何状态。
+// 参与者对当前保密段只见占位，不获得该段文字、变化数量或提议信息；解除保密后可重查。
+app.get('/api/diff', requireAuth, wrap((req, res) => {
+  const from = parseInt(req.query.from, 10);
+  const to = parseInt(req.query.to, 10);
+  res.json(store.diffView(db, from, to, req.user));
+}));
+
 // ---------- 提议依据附件 ----------
 // 上传：请求体为文件原始字节（application/octet-stream，或任意非 JSON 类型），
 // 原始文件名与预期 SHA-256 经请求头提交。仅记录员、且仅对本人“待复核”提议。

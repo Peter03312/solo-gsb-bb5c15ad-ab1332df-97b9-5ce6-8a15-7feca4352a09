@@ -1,6 +1,6 @@
 'use strict';
 // 业务核心：导入、提议、采纳/驳回、冲突标记、发布合版、版本视图、异议引用、基版过期提议的续提
-const { codeLength, sliceCP, validateRange, overlaps, applyEdits, transformRange, transformRangeRebase, editTouchesAnchor, replayProvenance } = require('./text');
+const { codeLength, sliceCP, validateRange, overlaps, applyEdits, transformRange, transformRangeRebase, editTouchesAnchor, replayProvenance, diffLineage } = require('./text');
 const att = require('./attachments');
 
 // ---------- 解析 ----------
@@ -1275,6 +1275,120 @@ function provenanceView(db, versionId, seg, viewer) {
   };
 }
 
+// ---------- 跨版净变化对照（两个按时间先后排列的已发布版本，按段对照） ----------
+// 净变化与促成提议全部沿“初始导入 → 逐次发布”的修订链坐标映射重放得到（见 text.diffLineage）：
+// 重复文字只凭码点稳定身份对齐，绝不按同文搜索配对；中途改动最终撤销且两端文字相同的整块
+// 不算变化，未变段不产生 changes。只读查询，不改写版本、决议或保密状态。
+function diffView(db, fromId, toId, viewer) {
+  if (!getDoc(db)) throw conflict('尚未导入逐字稿，无版本可对照', 'NO_DOCUMENT');
+  if (!Number.isInteger(fromId) || !Number.isInteger(toId)) {
+    throw badRequest('缺少有效的版本号：须提供整数 from 与 to（按时间先后排列的两个已发布版本）');
+  }
+  if (fromId >= toId) {
+    throw conflict(
+      `版本顺序不合法：旧版 v${fromId} 必须早于新版 v${toId}（要求 from < to，且均为已发布版本）`,
+      'BAD_VERSION_ORDER'
+    );
+  }
+  const vFrom = db.prepare('SELECT * FROM versions WHERE id=?').get(fromId);
+  if (!vFrom) throw notFound(`旧版 v${fromId} 不存在，无法对照`);
+  const vTo = db.prepare('SELECT * FROM versions WHERE id=?').get(toId);
+  if (!vTo) throw notFound(`新版 v${toId} 不存在，无法对照`);
+
+  const staff = isStaff(viewer);
+  const secrets = secretSegs(db);
+  const fromSegments = segmentsOf(vFrom);
+  const toSegments = segmentsOf(vTo);
+  const v1 = db.prepare('SELECT * FROM versions WHERE id=1').get();
+  const v1Segments = segmentsOf(v1);
+
+  // 一次性取截至新版（≤ toId）的全部已发布修订，按版本、段分组；坐标为各自发布时的基版坐标。
+  // 重放身份链必须从 v1 经过所有历史发布才能到达两端版本（含 fromId 之前的发布）；
+  // 哪些提议算作“促成 from→to 净变化”，由 text.diffLineage 再按 (from, to] 区间过滤。
+  const rows = db
+    .prepare(
+      `SELECT id, seg, start_cp, end_cp, replacement, published_version_id AS ver
+       FROM proposals
+       WHERE status='published' AND published_version_id >= 2 AND published_version_id <= ?
+       ORDER BY published_version_id, seg, start_cp, id`
+    )
+    .all(toId);
+  const editsByVerSeg = new Map(); // key ver:seg -> edits
+  for (const p of rows) {
+    const key = `${p.ver}:${p.seg}`;
+    if (!editsByVerSeg.has(key)) editsByVerSeg.set(key, []);
+    editsByVerSeg.get(key).push({ id: p.id, start: p.start_cp, end: p.end_cp, replace: p.replacement });
+  }
+
+  const segments = [];
+  let changedSegments = 0;
+  let changeCount = 0;
+  for (const sTo of toSegments) {
+    const seg = sTo.seg;
+    const fromIdx = segIndex(fromSegments, seg);
+    const v1Idx = segIndex(v1Segments, seg);
+    // 段号跨版本不变（发布只改段内正文）；异常数据明确报错而非编造对照
+    if (fromIdx === -1 || v1Idx === -1) {
+      throw Object.assign(
+        new Error(`版本对照失败：第 ${seg} 段在 v1/v${fromId} 中缺失（段结构异常，拒绝编造结果）`),
+        { status: 500, code: 'DIFF_INCONSISTENT' }
+      );
+    }
+
+    // 保密段：参与者只见占位，不获得该段文字、变化数量或提议信息；工作人员按现有权限查看
+    if (!staff && secrets.has(seg)) {
+      segments.push({ seg, secret: true, text: SECRET_PLACEHOLDER, changes: [], changeCount: 0 });
+      continue;
+    }
+
+    const steps = [];
+    for (let ver = 2; ver <= toId; ver++) {
+      const edits = editsByVerSeg.get(`${ver}:${seg}`);
+      if (edits && edits.length) steps.push({ version: ver, edits });
+    }
+    const result = diffLineage(v1Segments[v1Idx].text, steps, fromId, toId);
+
+    // 重放结果必须与两个不可变快照逐码点一致；不一致只可能是数据损坏，报错而非编造
+    if (result.versions[fromId] !== fromSegments[fromIdx].text || result.versions[toId] !== sTo.text) {
+      throw Object.assign(
+        new Error(`版本对照重放与第 ${seg} 段版本快照不一致，拒绝输出对照（数据可能已损坏）`),
+        { status: 500, code: 'DIFF_MISMATCH' }
+      );
+    }
+
+    if (result.hunks.length) {
+      changedSegments++;
+      changeCount += result.hunks.length;
+    }
+    segments.push({
+      seg,
+      secret: false,
+      oldText: fromSegments[fromIdx].text,
+      newText: sTo.text,
+      oldLength: codeLength(fromSegments[fromIdx].text),
+      newLength: codeLength(sTo.text),
+      changeCount: result.hunks.length,
+      changes: result.hunks,
+    });
+  }
+
+  return {
+    from: {
+      versionId: fromId,
+      note: staff ? vFrom.note : '',
+      createdAt: vFrom.created_at,
+    },
+    to: {
+      versionId: toId,
+      note: staff ? vTo.note : '',
+      createdAt: vTo.created_at,
+    },
+    changedSegments,
+    changeCount,
+    segments,
+  };
+}
+
 module.exports = {
   parseTranscript,
   importTranscript,
@@ -1291,6 +1405,7 @@ module.exports = {
   boothView,
   versionView,
   provenanceView,
+  diffView,
   stageProposals,
   previewSegments,
   setSegmentSecret,
